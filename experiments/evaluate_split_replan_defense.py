@@ -62,15 +62,44 @@ from agentdojo.attacks import (
 # CONFIGURATION
 # ============================================================================
 
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "google"]
+SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter"]
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # System prompt (same as dual defense)
 SYSTEM_PROMPT = """You are a helpful {suite_name} assistant."""
 
 
+
 # ============================================================================
 # PROVIDER SUPPORT
 # ============================================================================
+
+
+RETRY_SLEEP_TOTAL = 0.0   # total seconds spent sleeping on 429s, across the whole run
+
+def get_retry_sleep() -> float:
+    return RETRY_SLEEP_TOTAL
+
+def _with_429_retry(client, max_attempts=12, default_wait=20):
+    import re, time, openai
+    orig = client.chat.completions.create
+
+    def create(*args, **kwargs):
+        global RETRY_SLEEP_TOTAL
+        for attempt in range(max_attempts):
+            try:
+                return orig(*args, **kwargs)
+            except openai.RateLimitError as e:
+                m = re.search(r"retry in (\d+(?:\.\d+)?)s", str(e))
+                wait = float(m.group(1)) + 2 if m else default_wait
+                print(f"[429] attempt {attempt + 1}/{max_attempts}, sleeping {wait:.0f}s")
+                RETRY_SLEEP_TOTAL += wait
+                time.sleep(wait)
+        return orig(*args, **kwargs)
+
+    client.chat.completions.create = create
+    return client
 
 def get_provider_client_and_llm(provider: str, model: str):
     """Get the appropriate client and LLM class for the specified provider."""
@@ -104,6 +133,18 @@ def get_provider_client_and_llm(provider: str, model: str):
         llm = GoogleLLM(model, client)
         return client, GoogleLLM, llm
     
+    elif provider == "openrouter":
+        import openai
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+        client = _with_429_retry(openai.OpenAI(
+            base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
+            api_key=api_key,
+        ))
+        llm = OpenAILLM(client, model)
+        return client, OpenAILLM, llm
+
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -114,6 +155,7 @@ def get_default_model_for_provider(provider: str) -> str:
         "openai": "gpt-4o-mini",
         "anthropic": "claude-3-5-sonnet-20241022",
         "google": "gemini-1.5-flash",
+        "openrouter": "google/gemma-4-26b-a4b-it:free",
     }
     return defaults.get(provider, "gpt-4o-mini")
 
@@ -485,6 +527,7 @@ def create_attack_defense_pipeline(
 
 def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label=""):
     """Run a single task and return utility + messages."""
+    sleep0 = get_retry_sleep()  # snapshot of total 429 sleep time before this pass
     start_time = time.perf_counter()
     try:
         runtime = FunctionsRuntime(suite.tools)
@@ -555,13 +598,13 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
                 if stats['influenced_tools']:
                     print(f"      Influenced: {stats['influenced_tools']}")
         
-        latency = time.perf_counter() - start_time
+        latency = time.perf_counter() - start_time - (get_retry_sleep() - sleep0)
         return utility, messages, stats, None, latency
         
     except Exception as e:
         if debug:
             print(f"      DEBUG {label}: Error - {str(e)[:80]}")
-        latency = time.perf_counter() - start_time
+        latency = time.perf_counter() - start_time - (get_retry_sleep() - sleep0)
         return False, [], None, str(e), latency
 
 
@@ -656,10 +699,29 @@ def run_evaluation(
     attack_latencies = []
     attack_defense_latencies = []
     task_total_latencies = []
+
+    # ---- Checkpoint / resume ----
+    checkpoint_path = os.getenv("TG_CHECKPOINT")
+    done_ids = set()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path) as f:
+            saved = json.load(f)
+        for d in saved:
+            if any(d.get(k) for k in ("benign_error", "benign_defense_error",
+                                      "attack_error", "attack_defense_error")):
+                continue  # errored task: rerun it
+            tr = TaskResult(task_id=d["task_id"], prompt=d["prompt"])
+            for k, v in d.items():
+                setattr(tr, k, v)
+            results.append(tr)
+            done_ids.add(tr.task_id)
+        print(f"[checkpoint] resumed {len(done_ids)} clean tasks from {checkpoint_path}")
     
     for task_id in eval_task_ids:
+        if task_id in done_ids:
+            continue
         user_task = suite.get_user_task_by_id(task_id)
-        
+
         if verbose:
             print(f"\n📋 Task: {task_id}")
             print(f"   Prompt: {user_task.PROMPT[:50]}...")
@@ -744,7 +806,27 @@ def run_evaluation(
         task_total_latencies.append(task_result.total_task_latency)
         
         results.append(task_result)
-    
+
+        if checkpoint_path:
+            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+            tmp = checkpoint_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump([vars(r) for r in results], f, default=str)
+            os.replace(tmp, checkpoint_path)  # atomic: a crash can't leave a half-written file
+
+    # Recompute counters from `results` so resumed tasks are included
+    benign_count = sum(1 for r in results if r.benign_utility)
+    benign_defense_count = sum(1 for r in results if r.benign_defense_utility)
+    attack_utility_count = sum(1 for r in results if r.attack_utility)
+    attack_defense_utility_count = sum(1 for r in results if r.attack_defense_utility)
+    attack_success_count = sum(1 for r in results if not r.attack_security)
+    defense_success_count = sum(1 for r in results if not r.attack_defense_security)
+    benign_latencies = [r.benign_latency for r in results]
+    benign_defense_latencies = [r.benign_defense_latency for r in results]
+    attack_latencies = [r.attack_latency for r in results]
+    attack_defense_latencies = [r.attack_defense_latency for r in results]
+    task_total_latencies = [r.total_task_latency for r in results]
+
     # Summary
     total = len(results)
     total_run_latency = time.perf_counter() - run_start_time
