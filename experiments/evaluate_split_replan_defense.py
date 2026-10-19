@@ -145,6 +145,15 @@ def get_provider_client_and_llm(provider: str, model: str):
         llm = OpenAILLM(client, model)
         return client, OpenAILLM, llm
 
+    elif provider == "local":
+        import openai
+        client = openai.OpenAI(
+            base_url=os.getenv("LOCAL_BASE_URL", "http://localhost:8000/v1"),
+            api_key="EMPTY",
+        )
+        llm = OpenAILLM(client, model)
+        return client, OpenAILLM, llm
+
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
