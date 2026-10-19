@@ -62,7 +62,7 @@ from agentdojo.attacks import (
 # CONFIGURATION
 # ============================================================================
 
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter"]
+SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter", "local"]
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
