@@ -478,6 +478,8 @@ class OpenAIValidatorClient:
             ],
             temperature=temperature,
             max_tokens=max_tokens,
+            # vLLM/Qwen only: disable thinking so validator JSON isn't truncated by max_tokens
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         return response.choices[0].message.content or ""
 
