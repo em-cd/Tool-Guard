@@ -105,6 +105,8 @@ class DefenseStats:
     failed_suspicion: int = 0
     replans_triggered: int = 0
     aborts: int = 0
+    loop_iterations: int = 0
+    auto_executed_after_rejection: int = 0
     influenced_tools: list = field(default_factory=list)
     validated_tools: list = field(default_factory=list)
 
@@ -1326,6 +1328,7 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
         
         for iteration in range(self.max_iters):
             self.defense._log(f"=== Iteration {iteration + 1} ===")
+            self.defense.stats.loop_iterations += 1
             
             # Get current tool lists
             influenced_list, others_list = self.defense._get_tool_lists(runtime)
@@ -1441,6 +1444,7 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
                 # Loop-breaking: auto-execute after too many rejections
                 self.defense.rejection_counts[chosen_tool] = self.defense.rejection_counts.get(chosen_tool, 0) + 1
                 if self.defense.rejection_counts[chosen_tool] >= self.defense.max_reject_same_tool:
+                    self.defense.stats.auto_executed_after_rejection += 1
                     self.defense._log(f"Loop break: {chosen_tool} rejected {self.defense.rejection_counts[chosen_tool]} times, auto-executing")
                     
                     # Auto-execute the tool instead of aborting
@@ -1485,6 +1489,7 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
                     continue
                 else:
                     # Validation failed but not auto-executing - continue to replan
+                    self.defense.stats.replans_triggered += 1
                     continue
             
             # Step 5: Validation passed - execute the tool

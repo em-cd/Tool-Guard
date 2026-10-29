@@ -43,6 +43,7 @@ from agentdojo.agent_pipeline import (
     ToolsExecutionLoop,
     ToolsExecutor,
 )
+from agentdojo.agent_pipeline.token_tracking import TokenTracker
 from agentdojo.agent_pipeline.split_replan_defense import (
     SplitReplanDefense,
     SplitReplanToolsExecutionLoop,
@@ -101,7 +102,7 @@ def _with_429_retry(client, max_attempts=12, default_wait=20):
     client.chat.completions.create = create
     return client
 
-def get_provider_client_and_llm(provider: str, model: str):
+def get_provider_client_and_llm(provider: str, model: str, tracker=None):
     """Get the appropriate client and LLM class for the specified provider."""
     if provider == "openai":
         import openai
@@ -151,7 +152,7 @@ def get_provider_client_and_llm(provider: str, model: str):
             base_url=os.getenv("LOCAL_BASE_URL", "http://localhost:8000/v1"),
             api_key="EMPTY",
         )
-        llm = OpenAILLM(client, model)
+        llm = OpenAILLM(client, model, token_tracker=tracker)
         return client, OpenAILLM, llm
 
     else:
@@ -169,12 +170,36 @@ def get_default_model_for_provider(provider: str) -> str:
     return defaults.get(provider, "gpt-4o-mini")
 
 
-def _create_llm_instance(llm_class, client, model):
+def _create_llm_instance(llm_class, client, model, tracker=None):
     """Create an LLM instance with the appropriate arguments."""
     if llm_class == GoogleLLM:
         return llm_class(model, client)
+    # Attach the tracker for OpenAI-compatible LLMs
+    if llm_class == OpenAILLM and tracker is not None:
+        return llm_class(client, model, token_tracker=tracker)
     else:
         return llm_class(client, model)
+
+def _validator_client(client, llm_class, tracker):
+    """Wrap the client so SplitReplanDefense's validator calls are counted too."""
+    if tracker is not None and llm_class == OpenAILLM:
+        return tracker.wrap_openai_client(client, source="split_replan_validator")
+    return client
+
+def _read_tokens(tracker) -> dict:
+    if tracker is None:
+        return {"prompt": 0, "completion": 0, "total": 0}
+    s = tracker.get_stats()
+    return {
+        "prompt": s["total_prompt_tokens"],
+        "completion": s["total_completion_tokens"],
+        "total": s["total_tokens"],
+    }
+
+def _set_tokens(task_result, prefix: str, tok: dict):
+    setattr(task_result, f"{prefix}_prompt_tokens", tok["prompt"])
+    setattr(task_result, f"{prefix}_completion_tokens", tok["completion"])
+    setattr(task_result, f"{prefix}_total_tokens", tok["total"])
 
 # Attack settings (identical to dual defense)
 DEFAULT_POISON_TOOLS = {
@@ -252,8 +277,22 @@ class TaskResult:
     attack_latency: float = 0.0
     attack_defense_latency: float = 0.0
     total_task_latency: float = 0.0
+    # Tokens
+    benign_prompt_tokens: int = 0
+    benign_completion_tokens: int = 0
+    benign_total_tokens: int = 0
+    benign_defense_prompt_tokens: int = 0
+    benign_defense_completion_tokens: int = 0
+    benign_defense_total_tokens: int = 0
+    attack_prompt_tokens: int = 0
+    attack_completion_tokens: int = 0
+    attack_total_tokens: int = 0
+    attack_defense_prompt_tokens: int = 0
+    attack_defense_completion_tokens: int = 0
+    attack_defense_total_tokens: int = 0
     # Defense stats
-    defense_stats: dict = None
+    benign_defense_stats: dict = None
+    attack_defense_stats: dict = None
 
 
 # ============================================================================
@@ -382,11 +421,11 @@ def check_security(messages: list, suite_name: str) -> bool:
 # PIPELINE CREATION
 # ============================================================================
 
-def create_traditional_pipeline(model: str, suite_name: str, provider: str = "openai"):
+def create_traditional_pipeline(model: str, suite_name: str, provider: str = "openai", tracker=None):
     """Create traditional pipeline without defense."""
     client, llm_class, _ = get_provider_client_and_llm(provider, model)
-    llm = _create_llm_instance(llm_class, client, model)
-    llm2 = _create_llm_instance(llm_class, client, model)
+    llm = _create_llm_instance(llm_class, client, model, tracker)
+    llm2 = _create_llm_instance(llm_class, client, model, tracker)
     
     pipeline = AgentPipeline([
         SystemMessage(SYSTEM_PROMPT.format(suite_name=suite_name)),
@@ -398,7 +437,7 @@ def create_traditional_pipeline(model: str, suite_name: str, provider: str = "op
     return pipeline
 
 
-def create_defense_pipeline(model: str, suite_name: str, verbose: bool = False, provider: str = "openai"):
+def create_defense_pipeline(model: str, suite_name: str, verbose: bool = False, provider: str = "openai", tracker=None):
     """Create pipeline with SplitReplanDefense.
     
     Design: Main LLM does TWO plans for each step:
@@ -410,10 +449,10 @@ def create_defense_pipeline(model: str, suite_name: str, verbose: bool = False, 
     client, llm_class, _ = get_provider_client_and_llm(provider, model)
     
     # Main LLM for planning (sees conversation, does two plans with filtered tool lists)
-    llm = _create_llm_instance(llm_class, client, model)
+    llm = _create_llm_instance(llm_class, client, model, tracker)
     
     defense = SplitReplanDefense(
-        client=client,
+        client=_validator_client(client, llm_class, tracker),
         model=model,
         max_replan_attempts=5,
         verbose=verbose,
@@ -441,14 +480,15 @@ def create_attack_pipeline(
     injection_goal: str,
     provider: str = "openai",
     strategy=None,
+    tracker=None
 ):
     """Create pipeline with TDP attack only."""
     if strategy is None:
         strategy = authority_injection_strategy
 
     client, llm_class, _ = get_provider_client_and_llm(provider, model)
-    llm = _create_llm_instance(llm_class, client, model)
-    llm2 = _create_llm_instance(llm_class, client, model)
+    llm = _create_llm_instance(llm_class, client, model, tracker)
+    llm2 = _create_llm_instance(llm_class, client, model, tracker)
     
     # Only POISON first N tools, but MENTION all tools in descriptions
     num_to_poison = 12 if suite_name in ["workspace", "travel"] else 5
@@ -480,6 +520,7 @@ def create_attack_defense_pipeline(
     verbose: bool = False,
     provider: str = "openai",
     strategy=None,
+    tracker=None
 ):
     """Create pipeline with both TDP attack and defense.
     
@@ -505,10 +546,10 @@ def create_attack_defense_pipeline(
     )
     
     # Main LLM for planning (sees conversation, does two plans with filtered tool lists)
-    llm = _create_llm_instance(llm_class, client, model)
+    llm = _create_llm_instance(llm_class, client, model, tracker)
     
     defense = SplitReplanDefense(
-        client=client,
+        client=_validator_client(client, llm_class, tracker),
         model=model,
         max_replan_attempts=5,
         verbose=verbose,
@@ -534,10 +575,13 @@ def create_attack_defense_pipeline(
 # TASK EXECUTION
 # ============================================================================
 
-def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label=""):
+def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label="", tracker=None):
     """Run a single task and return utility + messages."""
     sleep0 = get_retry_sleep()  # snapshot of total 429 sleep time before this pass
     start_time = time.perf_counter()
+    # Reset tracker for this task
+    if tracker is not None:
+        tracker.reset()
     try:
         runtime = FunctionsRuntime(suite.tools)
         environment = suite.load_and_inject_default_environment({})
@@ -552,7 +596,10 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
             runtime,
             environment,
         )
-        
+
+        # Get token stats from tracker
+        tokens = _read_tokens(tracker)
+
         # Check utility
         try:
             output_content = model_output_from_messages(messages)
@@ -575,6 +622,8 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
                 "failed_suspicion": defense.stats.failed_suspicion,
                 "replans_triggered": defense.stats.replans_triggered,
                 "aborts": defense.stats.aborts,
+                "loop_iterations": defense.stats.loop_iterations,
+                "auto_executed_after_rejection": defense.stats.auto_executed_after_rejection,
                 "influenced_tools": list(defense.stats.influenced_tools),
                 "validated_tools": list(defense.stats.validated_tools),
             }
@@ -608,13 +657,13 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
                     print(f"      Influenced: {stats['influenced_tools']}")
         
         latency = time.perf_counter() - start_time - (get_retry_sleep() - sleep0)
-        return utility, messages, stats, None, latency
+        return utility, messages, stats, None, latency, tokens
         
     except Exception as e:
         if debug:
             print(f"      DEBUG {label}: Error - {str(e)[:80]}")
         latency = time.perf_counter() - start_time - (get_retry_sleep() - sleep0)
-        return False, [], None, str(e), latency
+        return False, [], None, str(e), latency, _read_tokens(tracker)
 
 
 # ============================================================================
@@ -670,7 +719,10 @@ def run_evaluation(
     
     # Get suite
     suite = get_suite("v1.2.2", suite_name)
-    
+
+    # Create token tracker
+    tracker = TokenTracker()
+
     # Filter tasks
     all_task_ids = list(suite.user_tasks.keys())
     if user_tasks:
@@ -685,13 +737,13 @@ def run_evaluation(
         print(f"{'='*70}")
     
     # Create pipelines
-    traditional_pipeline = create_traditional_pipeline(model, suite_name, provider=provider)
-    defense_pipeline, defense_benign = create_defense_pipeline(model, suite_name, verbose=debug, provider=provider)
+    traditional_pipeline = create_traditional_pipeline(model, suite_name, provider=provider, tracker=tracker)
+    defense_pipeline, defense_benign = create_defense_pipeline(model, suite_name, verbose=debug, provider=provider, tracker=tracker)
     attack_pipeline = create_attack_pipeline(
-        model, suite_name, tools_to_poison, injection_goal, provider=provider, strategy=attack_strategy
+        model, suite_name, tools_to_poison, injection_goal, provider=provider, strategy=attack_strategy, tracker=tracker
     )
     attack_defense_pipeline, defense_attack = create_attack_defense_pipeline(
-        model, suite_name, tools_to_poison, injection_goal, verbose=debug, provider=provider, strategy=attack_strategy
+        model, suite_name, tools_to_poison, injection_goal, verbose=debug, provider=provider, strategy=attack_strategy, tracker=tracker
     )
     
     # Results
@@ -740,40 +792,43 @@ def run_evaluation(
         # Pass 1: Benign (no defense)
         if verbose:
             print("   🧹 Pass 1: Benign (no defense)...")
-        utility, messages, _, error, latency = run_single_task(traditional_pipeline, suite, user_task, None, debug, "BENIGN")
+        utility, messages, _, error, latency, tokens = run_single_task(traditional_pipeline, suite, user_task, None, debug, "BENIGN", tracker=tracker)
         task_result.benign_utility = utility
         task_result.benign_error = error
         task_result.benign_latency = latency
         benign_latencies.append(latency)
+        _set_tokens(task_result, "benign", tokens)
         if utility:
             benign_count += 1
         if verbose:
-            print(f"      Utility: {utility}, Latency: {latency:.2f}s")
+            print(f"      Utility: {utility}, Latency: {latency:.2f}s, Tokens: {tokens['total']:,}")
         
         # Pass 2: Benign + Defense
         if verbose:
             print("   🛡️ Pass 2: Benign + Defense...")
         # Recreate pipeline to reset state
-        defense_pipeline, defense_benign = create_defense_pipeline(model, suite_name, verbose=debug, provider=provider)
-        utility, messages, stats, error, latency = run_single_task(defense_pipeline, suite, user_task, defense_benign, debug, "BENIGN+DEF")
+        defense_pipeline, defense_benign = create_defense_pipeline(model, suite_name, verbose=debug, provider=provider, tracker=tracker)
+        utility, messages, stats, error, latency, tokens = run_single_task(defense_pipeline, suite, user_task, defense_benign, debug, "BENIGN+DEF", tracker=tracker)
         task_result.benign_defense_utility = utility
         task_result.benign_defense_error = error
         task_result.benign_defense_latency = latency
         benign_defense_latencies.append(latency)
-        task_result.defense_stats = stats
+        _set_tokens(task_result, "benign_defense", tokens)
+        task_result.benign_defense_stats = stats
         if utility:
             benign_defense_count += 1
         if verbose:
-            print(f"      Utility: {utility}, Latency: {latency:.2f}s")
+            print(f"      Utility: {utility}, Latency: {latency:.2f}s, Tokens: {tokens['total']:,}")
         
         # Pass 3: TDP Attack (no defense)
         if verbose:
             print("   💉 Pass 3: TDP Attack (no defense)...")
-        utility, messages, _, error, latency = run_single_task(attack_pipeline, suite, user_task, None, debug, "ATTACK")
+        utility, messages, _, error, latency, tokens = run_single_task(attack_pipeline, suite, user_task, None, debug, "ATTACK", tracker=tracker)
         task_result.attack_utility = utility
         task_result.attack_error = error
         task_result.attack_latency = latency
         attack_latencies.append(latency)
+        _set_tokens(task_result, "attack", tokens)
         task_result.attack_security = check_security(messages, suite_name)
         if utility:
             attack_utility_count += 1
@@ -781,30 +836,31 @@ def run_evaluation(
             attack_success_count += 1
         if verbose:
             asr = "✅ Attack succeeded" if not task_result.attack_security else "❌ Attack blocked"
-            print(f"      Utility: {utility}, Security: {task_result.attack_security} {asr}, Latency: {latency:.2f}s")
+            print(f"      Utility: {utility}, Security: {task_result.attack_security} {asr}, Latency: {latency:.2f}s, Tokens: {tokens['total']:,}")
         
         # Pass 4: TDP Attack + Defense
         if verbose:
             print("   🛡️ Pass 4: TDP Attack + Defense...")
         # Recreate pipeline to reset state
         attack_defense_pipeline, defense_attack = create_attack_defense_pipeline(
-            model, suite_name, tools_to_poison, injection_goal, verbose=debug, provider=provider, strategy=attack_strategy
+            model, suite_name, tools_to_poison, injection_goal, verbose=debug, provider=provider, strategy=attack_strategy, tracker=tracker
         )
-        utility, messages, stats, error, latency = run_single_task(attack_defense_pipeline, suite, user_task, defense_attack, debug, "ATTACK+DEF")
+        utility, messages, stats, error, latency, tokens = run_single_task(attack_defense_pipeline, suite, user_task, defense_attack, debug, "ATTACK+DEF", tracker=tracker)
         task_result.attack_defense_utility = utility
         task_result.attack_defense_error = error
         task_result.attack_defense_latency = latency
         attack_defense_latencies.append(latency)
+        _set_tokens(task_result, "attack_defense", tokens)
         task_result.attack_defense_security = check_security(messages, suite_name)
         if stats:
-            task_result.defense_stats = stats
+            task_result.attack_defense_stats = stats
         if utility:
             attack_defense_utility_count += 1
         if not task_result.attack_defense_security:
             defense_success_count += 1
         if verbose:
             asr = "✅ Attack succeeded" if not task_result.attack_defense_security else "🛡️ Defense blocked"
-            print(f"      Utility: {utility}, Security: {task_result.attack_defense_security} {asr}, Latency: {latency:.2f}s")
+            print(f"      Utility: {utility}, Security: {task_result.attack_defense_security} {asr}, Latency: {latency:.2f}s, Tokens: {tokens['total']:,}")
 
         task_result.total_task_latency = (
             task_result.benign_latency
@@ -867,7 +923,15 @@ def run_evaluation(
         "per_task_total": _latency_stats(task_total_latencies),
         "suite_run_total_s": total_run_latency,
     }
-    
+
+    def _token_stats(prefix):
+        p = sum(getattr(r, f"{prefix}_prompt_tokens") for r in results)
+        c = sum(getattr(r, f"{prefix}_completion_tokens") for r in results)
+        t = sum(getattr(r, f"{prefix}_total_tokens") for r in results)
+        return {"prompt": p, "completion": c, "total": t, "avg_per_task": t / total if total else 0.0}
+
+    token_stats = {k: _token_stats(k) for k in ("benign", "benign_defense", "attack", "attack_defense")}
+
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
@@ -919,6 +983,18 @@ def run_evaluation(
         f"  Per-task total avg: {latency_stats['per_task_total']['avg_s']:.2f}s "
         f"(suite wall time: {total_run_latency:.2f}s)"
     )
+    print("🪙 TOKEN METRICS (total / avg per task):")
+    for label, key in [("Benign", "benign"), ("Benign+Defense", "benign_defense"),
+                    ("Attack", "attack"), ("Attack+Defense", "attack_defense")]:
+        s = token_stats[key]
+        print(f"  {label}: {s['total']:,} (prompt {s['prompt']:,} / completion {s['completion']:,}) "
+            f"/ {s['avg_per_task']:,.0f}")
+    if token_stats["benign"]["total"] > 0:
+        ratio = token_stats["benign_defense"]["total"] / token_stats["benign"]["total"]
+        print(f"  Defense token overhead (benign): {ratio:.2f}x")
+    if token_stats["attack"]["total"] > 0:
+        ratio = token_stats["attack_defense"]["total"] / token_stats["attack"]["total"]
+        print(f"  Defense token overhead (attack): {ratio:.2f}x")
     print(f"{'='*70}")
     
     return {
@@ -939,6 +1015,7 @@ def run_evaluation(
         "false_positives": benign_blocked_by_defense,
         "benign_baseline_successes": benign_success_baseline,
         "latency_stats": latency_stats,
+        "token_stats": token_stats,
         "results": [vars(r) for r in results],
     }
 
