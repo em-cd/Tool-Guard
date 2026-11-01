@@ -109,6 +109,7 @@ class DefenseStats:
     auto_executed_after_rejection: int = 0
     influenced_tools: list = field(default_factory=list)
     validated_tools: list = field(default_factory=list)
+    validation_log: list = field(default_factory=list) # for overthinking experiment
 
 
 # ============================================================================
@@ -878,13 +879,19 @@ class SplitReplanDefense(BasePipelineElement):
         
         if not is_aligned:
             self.stats.failed_alignment += 1
-            return ValidationResult(
+            result = ValidationResult(
                 tool_name=tool_name,
                 tool_args=tool_args,
                 is_aligned=False,
                 is_suspicious=False,  # Not checked
                 alignment_reason=alignment_reason,
             )
+            self.stats.validation_log.append({
+                "tool": tool_name, "args": tool_args,
+                "aligned": False, "suspicious": None,
+                "align_reason": alignment_reason, "susp_reason": None,
+            })
+            return result
         
         # Stage 2: Suspicion check (only if aligned)
         is_suspicious, suspicion_reason = self.validator.check_suspicion(
@@ -904,8 +911,8 @@ class SplitReplanDefense(BasePipelineElement):
             self.stats.failed_suspicion += 1
         else:
             self.stats.passed_validations += 1
-        
-        return ValidationResult(
+
+        result = ValidationResult(
             tool_name=tool_name,
             tool_args=tool_args,
             is_aligned=True,
@@ -913,6 +920,12 @@ class SplitReplanDefense(BasePipelineElement):
             alignment_reason=alignment_reason,
             suspicion_reason=suspicion_reason,
         )
+        self.stats.validation_log.append({
+            "tool": tool_name, "args": tool_args,
+            "aligned": True, "suspicious": is_suspicious,
+            "align_reason": alignment_reason, "susp_reason": suspicion_reason,
+        })
+        return result
     
     def _split_replan(
         self,

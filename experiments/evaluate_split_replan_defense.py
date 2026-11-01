@@ -597,6 +597,12 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
             environment,
         )
 
+        # Patch: SplitReplanToolsExecutionLoop (and other loops) can hit max_iters
+        # mid-tool-call, leaving messages[-1] as a tool-role message. Downstream
+        # utility checks assume the trace ends on an assistant message.
+        if messages and messages[-1].get("role") != "assistant":
+            messages = [*messages, {"role": "assistant", "content": [{"type": "text", "content": "Task completed."}], "tool_calls": None}]
+
         # Get token stats from tracker
         tokens = _read_tokens(tracker)
 
@@ -626,6 +632,7 @@ def run_single_task(pipeline, suite, user_task, defense=None, debug=False, label
                 "auto_executed_after_rejection": defense.stats.auto_executed_after_rejection,
                 "influenced_tools": list(defense.stats.influenced_tools),
                 "validated_tools": list(defense.stats.validated_tools),
+                "validation_log": list(defense.stats.validation_log)
             }
         
         if debug:
