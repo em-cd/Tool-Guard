@@ -504,12 +504,26 @@ class OpenAIValidatorClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=1.0,          # Qwen thinking/general (ignores the 0.0 passed in)
+            top_p=0.95,
+            presence_penalty=1.5,
+            max_tokens=8192,
             # vLLM/Qwen only: disable thinking so validator JSON isn't truncated by max_tokens
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={"chat_template_kwargs": {
+                "top_k": 20,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+                "chat_template_kwargs": {"enable_thinking": True},
+            }},
         )
-        return response.choices[0].message.content or ""
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            return json.dumps({"error": "validator output truncated"})
+        text = choice.message.content or ""
+        # Drop chain-of-thought if the server didn't split it into reasoning_content
+        if "</think>" in text:
+            text = text.rsplit("</think>", 1)[1]
+        return text.strip()
 
 
 class AnthropicValidatorClient:
@@ -1044,7 +1058,7 @@ class SplitReplanDefense(BasePipelineElement):
                 influenced_result=influenced_result,
                 others_result=others_result,
             )
-    
+
     def validate_tool_call(
         self,
         user_query: str,
@@ -1413,7 +1427,7 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
         runtime: FunctionsRuntime,
         env: Env = EmptyEnv(),
         messages: Sequence[ChatMessage] = [],
-        extra_args: dict = {},
+        extra_args: dict = {}
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
         """Execute tools with split isolation defense."""
         
