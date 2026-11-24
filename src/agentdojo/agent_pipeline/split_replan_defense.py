@@ -110,6 +110,8 @@ class DefenseStats:
     influenced_tools: list = field(default_factory=list)
     validated_tools: list = field(default_factory=list)
     validation_log: list = field(default_factory=list) # for overthinking experiment
+    terminate_votes: int = 0
+    unjudged_terminations: int = 0
 
 
 # ============================================================================
@@ -250,6 +252,29 @@ NO_TOOL_SUITABLE_FUNCTION = Function(
     return_type=str,
 )
 
+# Overthinking defense extension
+class TerminateParams(BaseModel):
+    """Parameters for explicit task termination."""
+    pass
+
+
+def _terminate_impl() -> str:
+    return "Planner decided the user task is complete."
+
+
+TERMINATE_FUNCTION = Function(
+    name="TERMINATE",
+    description=(
+        "Select this when the user's original task has been fully completed. "
+        "No further tool calls are necessary. Do not select this merely because "
+        "no suitable tool is available in the current list."
+    ),
+    parameters=TerminateParams,
+    dependencies={},
+    run=_terminate_impl,
+    full_docstring="Terminate because the user task is complete.",
+    return_type=str,
+)
 
 # ============================================================================
 # PROMPT CREATION FUNCTIONS
@@ -1164,6 +1189,18 @@ class SplitReplanDefense(BasePipelineElement):
         self.validated_messages = []
         self.stats = DefenseStats()
         self.rejection_counts = {}
+
+    # Defense variant: terminate
+    def confirm_termination(self, user_query: str) -> tuple[bool, str]:
+        """Called when a planner votes TERMINATE. Default: trust the planner."""
+        return True, "no termination judge configured"
+
+    # Defense variant: removed list
+    def on_validation_failure(self, tool_name: str) -> bool:
+        """Called when a chosen tool fails validation.
+        Return True if the subclass handled it (the loop should just replan).
+        Return False to fall through to the original isolate/auto-execute logic."""
+        return False
     
     def query(
         self,
@@ -1215,11 +1252,13 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
         tools_executor: BasePipelineElement,
         defense: SplitReplanDefense,
         max_iters: int = 15,
+        include_terminate: bool = False
     ):
         self.llm = llm
         self.tools_executor = tools_executor
         self.defense = defense
         self.max_iters = max_iters
+        self.include_terminate = include_terminate
         
         # Detect if using GoogleLLM - it doesn't work well with no_tool_suitable
         self._is_google_llm = type(llm).__name__ == "GoogleLLM"
@@ -1233,6 +1272,11 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
         # Add no_tool_suitable as an explicit option for the LLM
         if include_no_tool:
             filtered_functions.append(NO_TOOL_SUITABLE_FUNCTION)
+
+        # Add terminate option
+        if self.include_terminate:
+            filtered_functions.append(TERMINATE_FUNCTION)
+
         return FunctionsRuntime(filtered_functions)
     
     def _plan_with_list(
@@ -1243,11 +1287,12 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
         env: Env,
         messages: Sequence[ChatMessage],
         extra_args: dict,
-        list_name: str,
-    ) -> tuple[str | None, dict | None]:
+        list_name: str
+    ) -> tuple[str, str | None, dict | None]:
         """Have main LLM plan with only the specified tools visible, plus no_tool_suitable option."""
+        # overthink defense: we may wish to try disabling this early return to allow a planner with an empty list to return TERMINATE?
         if not tool_names:
-            return None, None
+            return "no_tool_suitable", None, None
         
         # Always include no_tool_suitable so planner can indicate no suitable tool
         include_no_tool = True
@@ -1280,10 +1325,21 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
             f"Do NOT call any tool not in this list, even if mentioned in tool descriptions. "
             f"If no tool in this list is suitable for the task, call 'no_tool_suitable'."
         )
-        
+
+        instructions = original_system_content + isolation_instruction
+
+        # Explicit terminate instructions
+        if self.include_terminate:
+            instructions += (
+            f"\n\nIMPORTANT: You also have access to TERMINATE. "
+            f"Call TERMINATE if the user's original task is already fully "
+            f"completed and no further actions are necessary. "
+            f"Do not continue taking actions simply because tools are available."
+        )
+
         planning_system_msg = {
             "role": "system",
-            "content": [{"type": "text", "content": original_system_content + isolation_instruction}],
+            "content": [{"type": "text", "content": instructions}],
         }
         clean_messages.append(planning_system_msg)
         
@@ -1308,20 +1364,48 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
             last_msg = new_messages[-1]
             if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
                 tool_call = last_msg["tool_calls"][0]  # Take first tool call
+                # Check for termination string if enabled
+                if self.include_terminate:
+                    if tool_call.function == "TERMINATE":
+                        self.defense._log(f"Planner explicitly selected TERMINATE ({list_name})")
+                        return "terminate", None, None
+
                 # If LLM explicitly chose no_tool_suitable, treat as None
                 if tool_call.function == "no_tool_suitable":
                     self.defense._log(f"LLM explicitly chose no_tool_suitable from {list_name} list")
-                    return None, None
+                    return "no_tool_suitable", None, None
                 
                 # STRICT ISOLATION (especially for Gemini which may hallucinate from context):
                 # Validate tool is actually in the allowed list
                 if tool_call.function not in tool_names:
                     self.defense._log(f"STRICT ISOLATION: {list_name} returned '{tool_call.function}' not in allowed list {list(tool_names)[:5]}..., treating as no_tool")
-                    return None, None
+                    return "no_tool_suitable", None, None
                 
-                return tool_call.function, tool_call.args
+                return "tool", tool_call.function, tool_call.args
         
-        return None, None
+        return "no_tool_suitable", None, None
+
+    def _finish(self, query, env, messages, extra_args):
+        """Generate the final answer from validated context only."""
+        clean = []
+        for role in ("system", "user"):
+            for msg in messages:
+                if msg.get("role") == role:
+                    clean.append(msg)
+                    break
+        for a, t in self.defense.validated_messages:
+            clean += [a, t]
+        fallback = {"role": "assistant",
+                    "content": [{"type": "text", "content": "Task completed."}],
+                    "tool_calls": None}
+        try:
+            _, _, _, final_messages, _ = self.llm.query(
+                query, FunctionsRuntime([]), env, list(clean), dict(extra_args))
+            if final_messages and len(final_messages) > len(clean):
+                return [*messages, final_messages[-1]]
+        except Exception as e:
+            self.defense._log(f"Error generating final response: {e}")
+        return [*messages, fallback]
     
     def query(
         self,
@@ -1352,13 +1436,13 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
             self.defense._log(f"Others tools: {others_names} (+ no_tool_suitable)")
             
             # Step 1: Main LLM plans with influenced list → Plan A
-            tool_a, args_a = self._plan_with_list(
+            status_a, tool_a, args_a = self._plan_with_list(
                 query, runtime, influenced_names, env, messages, extra_args, "influenced"
             )
             self.defense._log(f"Plan A (influenced): {tool_a}")
             
             # Step 2: Main LLM plans with others list → Plan B
-            tool_b, args_b = self._plan_with_list(
+            status_b, tool_b, args_b = self._plan_with_list(
                 query, runtime, others_names, env, messages, extra_args, "others"
             )
             self.defense._log(f"Plan B (others): {tool_b}")
@@ -1367,7 +1451,22 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
             chosen_tool = None
             chosen_args = None
             chosen_source = None
-            
+
+            # Terminate option
+            voted_terminate = "terminate" in (status_a, status_b)
+            if voted_terminate:
+                self.defense.stats.terminate_votes += 1
+
+            # Explicit termination takes precedence over tool selection.
+            if voted_terminate and (tool_a or tool_b):
+                done, why = self.defense.confirm_termination(query)
+                self.defense._log(f"Termination judge: complete={done} ({why})")
+                if done:
+                    messages = self._finish(query, env, messages, extra_args)
+                    break
+                # judge said not complete: ignore the vote, fall through to the
+                # decision matrix with whatever the other planner proposed
+
             if tool_a and not tool_b:
                 # A=tool, B=no_tool → Use A
                 chosen_tool, chosen_args, chosen_source = tool_a, args_a, "influenced"
@@ -1386,6 +1485,9 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
                     chosen_tool, chosen_args, chosen_source = tool_b, args_b, "others"
                     self.defense._log("Decision: Random chose Plan B (others)")
             else:
+                if voted_terminate:
+                    self.defense.stats.unjudged_terminations += 1
+                    
                 # A=no_tool, B=no_tool → Done - generate proper final response
                 self.defense._log("Decision: Both plans returned no tool, generating final response")
                 
@@ -1446,12 +1548,14 @@ class SplitReplanToolsExecutionLoop(BasePipelineElement):
             validation = self.defense._validate_tool(query, chosen_tool, chosen_args, tool_description)
             
             if not validation.passed:
+                reason = validation.alignment_reason if not validation.is_aligned else validation.suspicion_reason
+                self.defense._log(f"Validation FAILED for {chosen_tool}: {reason}")
+                if self.defense.on_validation_failure(chosen_tool):
+                    continue  # handled by the variant: just replan
                 # Validation failed - move tool to influenced list
                 self.defense.influenced_tools.add(chosen_tool)
                 if chosen_tool not in self.defense.stats.influenced_tools:
                     self.defense.stats.influenced_tools.append(chosen_tool)
-                reason = validation.alignment_reason if not validation.is_aligned else validation.suspicion_reason
-                self.defense._log(f"Validation FAILED for {chosen_tool}: {reason}")
                 self.defense._log(f"Moving {chosen_tool} to influenced list, will replan...")
                 
                 # Loop-breaking: auto-execute after too many rejections
